@@ -1,3 +1,12 @@
+## 💡 Project Status
+
+This project is in early MVP stage.
+
+👉 Join the discussion:  
+https://github.com/akshayhudke/SQL_Analyst/discussions
+
+We’re actively shaping the roadmap and welcoming feedback.
+
 # QuerySense (Local MVP)
 
 A Dockerized, open-source SQL performance assistant that analyzes SQL structure and PostgreSQL execution plans, then produces explainable optimization recommendations. LLM usage is strictly for explanation and safe rewrites, never for executing queries.
