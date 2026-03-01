@@ -57,6 +57,7 @@ class AnalyzeResponse(BaseModel):
     plan_summary: Optional[PlanSummary]
     rule_findings: List[RuleFinding]
     llm: Optional[LLMOutput]
+    diagnostics: Optional[Dict[str, Any]] = None
     preview: Optional[QueryPreview]
     raw_plan: Optional[Dict[str, Any]]
     warnings: List[str]

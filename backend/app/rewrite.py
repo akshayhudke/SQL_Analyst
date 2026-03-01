@@ -2,6 +2,13 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 import re
+import sqlglot
+from sqlglot import exp
+
+
+def _norm_expr(value: str) -> str:
+    """Normalize expression text for comparisons."""
+    return " ".join(value.lower().strip().split())
 
 
 def _build_columns(
@@ -28,17 +35,75 @@ def _build_columns(
     return columns or None
 
 
-def rewrite_query(
+def _rewrite_group_by_mismatch(
+    original_sql: str,
+    parsed_sql: Dict[str, Any],
+) -> Tuple[Optional[str], List[str]]:
+    """Fix invalid GROUP BY by aligning grouped expressions with selected columns."""
+    notes: List[str] = []
+    missing = parsed_sql.get("group_by_missing_expressions") or []
+    if not missing:
+        return None, notes
+    if parsed_sql.get("has_group_ordinal"):
+        return None, notes
+
+    try:
+        expression = sqlglot.parse_one(original_sql, read="postgres")
+    except Exception:
+        expression = sqlglot.parse_one(original_sql)
+
+    non_agg = parsed_sql.get("non_agg_select_expressions") or []
+    group_by = parsed_sql.get("group_by") or []
+    group = expression.find(exp.Group)
+    if group is None and non_agg:
+        group = exp.Group(
+            expressions=[
+                sqlglot.parse_one(f"SELECT {expr_sql}", read="postgres").find(exp.Select).expressions[0]
+                for expr_sql in non_agg
+            ]
+        )
+        select = expression.find(exp.Select)
+        if select is None:
+            return None, notes
+        select.set("group", group)
+        notes.append("Added GROUP BY for non-aggregated SELECT expressions.")
+        return expression.sql(dialect="postgres"), notes
+    if group is None:
+        return None, notes
+
+    non_agg_set = {_norm_expr(item) for item in non_agg}
+    group_set = {_norm_expr(item) for item in group_by}
+
+    new_group_expressions: List[exp.Expression] = []
+    if non_agg and group_set and all(item not in non_agg_set for item in group_set):
+        for expr_sql in non_agg:
+            parsed_expr = sqlglot.parse_one(f"SELECT {expr_sql}", read="postgres").find(exp.Select).expressions[0]
+            new_group_expressions.append(parsed_expr)
+        notes.append("Replaced GROUP BY with non-aggregated SELECT expressions to fix invalid aggregation.")
+    else:
+        for item in group.expressions:
+            new_group_expressions.append(item)
+        existing = {_norm_expr(item.sql(dialect="postgres")) for item in group.expressions}
+        for expr_sql in missing:
+            if _norm_expr(expr_sql) in existing:
+                continue
+            parsed_expr = sqlglot.parse_one(f"SELECT {expr_sql}", read="postgres").find(exp.Select).expressions[0]
+            new_group_expressions.append(parsed_expr)
+        notes.append("Added missing non-aggregated SELECT expressions to GROUP BY.")
+
+    group.set("expressions", new_group_expressions)
+    return expression.sql(dialect="postgres"), notes
+
+
+def _rewrite_select_star(
     original_sql: str,
     parsed_sql: Dict[str, Any],
     columns_by_table: Dict[str, List[str]],
 ) -> Tuple[Optional[str], List[str]]:
     """Rewrite SELECT * into explicit columns while preserving formatting."""
     notes: List[str] = []
-
     if not parsed_sql.get("has_select_star"):
         return None, notes
-
     select_columns = parsed_sql.get("select_columns") or []
     if len(select_columns) != 1 or select_columns[0].strip() != "*":
         return None, notes
@@ -80,3 +145,28 @@ def rewrite_query(
 
     notes.append("Expanded SELECT * into explicit columns using schema metadata.")
     return rewritten, notes
+
+
+def rewrite_query(
+    original_sql: str,
+    parsed_sql: Dict[str, Any],
+    columns_by_table: Dict[str, List[str]],
+) -> Tuple[Optional[str], List[str]]:
+    """Apply safe deterministic rewrites and return the best fixed query."""
+    notes: List[str] = []
+    candidate = original_sql
+    changed = False
+
+    group_rewrite, group_notes = _rewrite_group_by_mismatch(candidate, parsed_sql)
+    if group_rewrite and group_rewrite.strip() != candidate.strip():
+        candidate = group_rewrite
+        notes.extend(group_notes)
+        changed = True
+
+    star_rewrite, star_notes = _rewrite_select_star(candidate, parsed_sql, columns_by_table)
+    if star_rewrite and star_rewrite.strip() != candidate.strip():
+        candidate = star_rewrite
+        notes.extend(star_notes)
+        changed = True
+
+    return (candidate if changed else None), notes

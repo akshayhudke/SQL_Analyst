@@ -7,6 +7,30 @@ from .plan_summary import iter_plan_nodes
 
 
 COLUMN_REGEX = re.compile(r"([a-zA-Z_][\w\.]*)\s*(=|<|>|<=|>=|!=|<>|ILIKE|LIKE|IN|ANY)")
+STRING_EQ_REGEX = re.compile(r"\b([a-zA-Z_][\w\.]*)\s*=\s*'([^']*)'")
+COMPARE_LITERAL_REGEX = re.compile(
+    r"\b([a-zA-Z_][\w\.]*)\s*(=|<|>|<=|>=|!=|<>)\s*(DATE\s+'[^']*'|'[^']*'|-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+LEADING_WILDCARD_REGEX = re.compile(r"\b([a-zA-Z_][\w\.]*)\s+(ILIKE|LIKE)\s+'%[^']*'", re.IGNORECASE)
+
+NUMERIC_TYPE_HINTS = {
+    "int2",
+    "int4",
+    "int8",
+    "smallint",
+    "integer",
+    "bigint",
+    "numeric",
+    "decimal",
+    "float4",
+    "float8",
+    "double precision",
+    "real",
+    "serial",
+    "bigserial",
+}
+DATE_TYPE_HINTS = {"date", "timestamp", "timestamptz", "time", "timetz"}
 
 
 def _add(
@@ -64,7 +88,7 @@ def _map_columns_to_tables(
             table = tables[0] if len(tables) == 1 else None
         if not table:
             continue
-        if columns_by_table and col_name not in columns_by_table.get(table, []):
+        if columns_by_table is not None and col_name not in columns_by_table.get(table, []):
             continue
         table_columns.setdefault(table, [])
         if col_name not in table_columns[table]:
@@ -73,11 +97,65 @@ def _map_columns_to_tables(
     return table_columns
 
 
+def _alias_map(table_aliases: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Build alias->table map from parsed table aliases."""
+    mapping: Dict[str, str] = {}
+    for entry in table_aliases or []:
+        table_name = entry.get("table")
+        alias = entry.get("alias") or table_name
+        if table_name:
+            mapping[table_name] = table_name
+        if table_name and alias:
+            mapping[alias] = table_name
+    return mapping
+
+
+def _column_type_map(schema_metadata: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """Build table->column->type map from schema metadata."""
+    result: Dict[str, Dict[str, str]] = {}
+    for table_name, info in (schema_metadata or {}).items():
+        col_types: Dict[str, str] = {}
+        for column in info.get("columns") or []:
+            col_name = str(column.get("name") or "")
+            if not col_name:
+                continue
+            type_name = str(column.get("udt_name") or column.get("data_type") or "").lower()
+            col_types[col_name.lower()] = type_name
+        result[table_name] = col_types
+    return result
+
+
+def _resolve_column_type(
+    column_ref: str,
+    parsed_sql: Dict[str, Any],
+    schema_metadata: Dict[str, Dict[str, Any]],
+) -> str | None:
+    """Resolve a SQL column reference to its physical type name when available."""
+    alias_map = _alias_map(parsed_sql.get("table_aliases") or [])
+    types = _column_type_map(schema_metadata)
+    ref = column_ref.strip().strip('"')
+    if "." in ref:
+        alias, col_name = ref.split(".", 1)
+        table_name = alias_map.get(alias)
+    else:
+        col_name = ref
+        table_name = parsed_sql.get("tables", [None])[0] if len(parsed_sql.get("tables", [])) == 1 else None
+    if not table_name:
+        return None
+    return types.get(table_name, {}).get(col_name.lower())
+
+
 def build_index_recommendations(
     parsed_sql: Dict[str, Any],
     columns_by_table: Dict[str, List[str]] | None = None,
 ) -> List[Dict[str, Any]]:
     """Suggest index statements from join and filter columns."""
+    if not parsed_sql.get("has_select"):
+        return []
+    if parsed_sql.get("group_by_missing_expressions"):
+        # Query is semantically invalid; correctness must be fixed before indexing.
+        return []
+
     join_columns: List[str] = []
     for condition in parsed_sql.get("join_conditions") or []:
         join_columns.extend(_extract_columns(condition))
@@ -163,9 +241,133 @@ def score_findings(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def run_rules(parsed_sql: Dict[str, Any], plan_json: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+def run_rules(
+    parsed_sql: Dict[str, Any],
+    plan_json: Dict[str, Any] | None,
+    schema_metadata: Dict[str, Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
     """Run all rule checks on SQL structure and plan output."""
     findings: List[Dict[str, Any]] = []
+    schema_metadata = schema_metadata or {}
+    statement_type = str(parsed_sql.get("statement_type", "SELECT")).upper()
+
+    if not parsed_sql.get("has_select"):
+        _add(
+            findings,
+            "sql_static_only",
+            "Static analysis for non-SELECT query",
+            1,
+            f"{statement_type} queries are analyzed without EXPLAIN in this MVP.",
+            "Use static findings first, then validate with EXPLAIN in the target environment.",
+            {"statement_type": statement_type},
+        )
+
+        if statement_type in {"UPDATE", "DELETE"} and not parsed_sql.get("has_where"):
+            _add(
+                findings,
+                "sql_write_no_where",
+                "Write query without WHERE",
+                3,
+                "UPDATE/DELETE without WHERE can affect very large row counts.",
+                "Add a selective WHERE clause and verify with a transaction-safe dry run.",
+                {"statement_type": statement_type},
+            )
+        return findings
+
+    missing_group_exprs = parsed_sql.get("group_by_missing_expressions") or []
+    if missing_group_exprs:
+        if parsed_sql.get("group_by"):
+            rationale = "Non-aggregated columns in SELECT must also be in GROUP BY."
+        else:
+            rationale = "Aggregate query has non-aggregated columns but no GROUP BY."
+        _add(
+            findings,
+            "sql_group_by_mismatch",
+            "GROUP BY is missing selected columns",
+            3,
+            rationale,
+            "Add missing selected columns to GROUP BY or aggregate them.",
+            {"missing_expressions": missing_group_exprs},
+        )
+
+    joins = parsed_sql.get("joins") or []
+    join_conditions = parsed_sql.get("join_conditions") or []
+    if joins and len(join_conditions) < len(joins):
+        _add(
+            findings,
+            "sql_join_missing_condition",
+            "Join without ON condition",
+            3,
+            "At least one JOIN has no explicit join condition and may create a Cartesian product.",
+            "Add explicit ON predicates for every JOIN unless CROSS JOIN is intentional.",
+            {"joins": joins, "join_conditions": join_conditions},
+        )
+    if any(str(kind).upper() == "CROSS" for kind in joins):
+        _add(
+            findings,
+            "sql_cross_join",
+            "CROSS JOIN detected",
+            2,
+            "CROSS JOIN multiplies row counts and is often accidental in OLTP analytics queries.",
+            "Use INNER/LEFT JOIN with explicit keys unless Cartesian expansion is intended.",
+            {"joins": joins},
+        )
+
+    where_text = parsed_sql.get("where") or ""
+    for column, literal in STRING_EQ_REGEX.findall(where_text):
+        lowered_column = column.lower()
+        if lowered_column.endswith(("id", "age", "count", "qty", "quantity", "amount", "price")):
+            if literal and not re.fullmatch(r"-?\d+(\.\d+)?", literal.strip()):
+                _add(
+                    findings,
+                    "sql_possible_type_mismatch",
+                    "Possible type mismatch in filter",
+                    2,
+                    "A numeric-looking column is compared to a non-numeric string literal.",
+                    "Use a typed literal (number/date) or cast explicitly.",
+                    {"column": column, "literal": literal},
+                )
+
+    for column_ref, operator, literal in COMPARE_LITERAL_REGEX.findall(where_text):
+        column_type = _resolve_column_type(column_ref, parsed_sql, schema_metadata)
+        if not column_type:
+            continue
+        literal_value = literal.strip()
+        is_quoted = literal_value.startswith("'") or literal_value.upper().startswith("DATE '")
+        is_numeric_literal = bool(re.fullmatch(r"-?\d+(\.\d+)?", literal_value))
+        if column_type in NUMERIC_TYPE_HINTS and is_quoted and not re.fullmatch(
+            r"'-?\d+(\.\d+)?'", literal_value
+        ):
+            _add(
+                findings,
+                "sql_implicit_type_conversion",
+                "Implicit type conversion risk",
+                2,
+                f"Column `{column_ref}` appears numeric (`{column_type}`) but is compared to a quoted literal.",
+                "Use numeric literals without quotes or cast explicitly to preserve index usage.",
+                {"column": column_ref, "operator": operator, "literal": literal_value, "column_type": column_type},
+            )
+        if column_type in DATE_TYPE_HINTS and is_numeric_literal:
+            _add(
+                findings,
+                "sql_date_literal_mismatch",
+                "Date/time comparison uses numeric literal",
+                2,
+                f"Column `{column_ref}` appears temporal (`{column_type}`) but compares to a numeric literal.",
+                "Use a typed date/timestamp literal, for example DATE '2024-01-01'.",
+                {"column": column_ref, "operator": operator, "literal": literal_value, "column_type": column_type},
+            )
+
+    for column_ref, operator in LEADING_WILDCARD_REGEX.findall(where_text):
+        _add(
+            findings,
+            "sql_non_sargable_like",
+            "Leading wildcard prevents index seek",
+            2,
+            f"{operator.upper()} with a leading wildcard on `{column_ref}` is usually non-sargable.",
+            "Avoid leading wildcard patterns or add trigram/full-text index based on use case.",
+            {"column": column_ref, "operator": operator.upper()},
+        )
 
     if parsed_sql.get("has_select_star"):
         _add(
@@ -216,7 +418,16 @@ def run_rules(parsed_sql: Dict[str, Any], plan_json: Dict[str, Any] | None) -> L
     for condition in parsed_sql.get("join_conditions") or []:
         join_columns.extend(_extract_columns(condition))
     index_candidates = sorted({*filter_columns, *join_columns})
-    if index_candidates:
+    blocker_ids = {
+        "sql_group_by_mismatch",
+        "sql_possible_type_mismatch",
+        "sql_implicit_type_conversion",
+        "sql_date_literal_mismatch",
+        "sql_join_missing_condition",
+        "sql_write_no_where",
+    }
+    existing_ids = {item.get("id") for item in findings}
+    if index_candidates and not missing_group_exprs and not (existing_ids & blocker_ids):
         _add(
             findings,
             "sql_index_candidates",
@@ -336,6 +547,23 @@ def run_rules(parsed_sql: Dict[str, Any], plan_json: Dict[str, Any] | None) -> L
                 "Nested loop joins can be slow with large inputs.",
                 "Consider indexes on join keys or rewriting for hash/merge joins.",
                 {"join_type": node.get("Join Type")},
+            )
+
+        if (
+            node_type == "Nested Loop"
+            and not node.get("Join Filter")
+            and not node.get("Hash Cond")
+            and not node.get("Merge Cond")
+            and actual_rows > 1000
+        ):
+            _add(
+                findings,
+                "plan_possible_cartesian",
+                "Possible Cartesian join in plan",
+                3,
+                "Nested loop join has no visible join condition and returns many rows.",
+                "Verify JOIN ON predicates to avoid accidental Cartesian products.",
+                {"node_type": node_type, "actual_rows": actual_rows},
             )
 
         if node_type == "Hash" and node.get("Hash Batches") and node.get("Hash Batches") > 1:

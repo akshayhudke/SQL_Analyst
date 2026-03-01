@@ -247,7 +247,13 @@ spec:
         - name: OLLAMA_URL
           value: http://qs-ollama:11434
         - name: OLLAMA_MODEL
-          value: qwen2.5:7b
+          value: qwen2.5:1.5b
+        - name: OLLAMA_MODEL_LIVE
+          value: qwen2.5:1.5b
+        - name: OLLAMA_MODEL_MANUAL
+          value: qwen2.5:1.5b
+        - name: OLLAMA_MODEL_FALLBACKS
+          value: qwen2.5:1.5b
         - name: LLM_ONLY_REWRITE
           value: "true"
         - name: TRAINING_STORE_ENABLED
@@ -331,7 +337,7 @@ If the UI is accessed outside the cluster, update `VITE_API_URL` to the backend 
 
 ## 10) Pull the LLM Model in the Cluster
 ```bash
-oc exec deploy/qs-ollama -- ollama pull qwen2.5:7b
+oc exec deploy/qs-ollama -- ollama pull qwen2.5:1.5b
 ```
 
 ## 11) Verify

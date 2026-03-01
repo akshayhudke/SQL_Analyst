@@ -224,6 +224,35 @@ function AnalysisPanel({ data }) {
         </Section>
       )}
 
+      {data.diagnostics && (
+        <Section title="Diagnostics">
+          <div className="grid">
+            <div>
+              <div className="metric-label">Statement</div>
+              <div className="metric-value">{data.diagnostics.statement_type || "n/a"}</div>
+            </div>
+            <div>
+              <div className="metric-label">Execution</div>
+              <div className="metric-value">
+                {data.diagnostics.execution_allowed ? "Allowed" : "Static only"}
+              </div>
+            </div>
+            <div>
+              <div className="metric-label">Missing Tables</div>
+              <div className="metric-value">
+                {(data.diagnostics.missing_tables || []).length}
+              </div>
+            </div>
+            <div>
+              <div className="metric-label">Stats Tables</div>
+              <div className="metric-value">
+                {Object.keys(data.diagnostics.table_statistics || {}).length}
+              </div>
+            </div>
+          </div>
+        </Section>
+      )}
+
       {data.llm && (
         <Section title="LLM Explanation">
           <div className="text-block">
@@ -331,6 +360,7 @@ export default function App() {
   const abortRef = useRef(null);
   const liveTimesRef = useRef([]);
   const manualTimesRef = useRef([]);
+  const lastLiveSqlRef = useRef("");
 
   const recordMetric = (ref, setRate, setLatency, latencyMs) => {
     const now = Date.now();
@@ -400,7 +430,7 @@ export default function App() {
         const params = buildTrainingParams();
         const [statsRes, listRes] = await Promise.all([
           fetch(`${API_URL}/api/training/stats?${params}`),
-          fetch(`${API_URL}/api/training/list?${buildTrainingParams({ limit: 20 })}`),
+          fetch(`${API_URL}/api/training/list?${buildTrainingParams({ limit: 4 })}`),
         ]);
         const statsData = await statsRes.json();
         const listData = await listRes.json();
@@ -518,6 +548,10 @@ export default function App() {
     if (!sql.trim()) {
       setLiveResult(null);
       setLiveStatus("idle");
+      lastLiveSqlRef.current = "";
+      return undefined;
+    }
+    if (sql.trim() === lastLiveSqlRef.current) {
       return undefined;
     }
 
@@ -539,7 +573,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             sql,
-            run_analyze: deepAnalyze,
+            run_analyze: false,
             run_preview: false,
             analysis_mode: "live",
           }),
@@ -551,6 +585,7 @@ export default function App() {
           throw new Error(data.detail || "Live analysis failed");
         }
 
+        lastLiveSqlRef.current = sql.trim();
         setLiveResult(data);
         setLiveStatus("ready");
         recordMetric(liveTimesRef, setLiveRate, setLiveLatency, performance.now() - started);
@@ -559,7 +594,7 @@ export default function App() {
         setLiveError(err.message || "Live analysis failed");
         setLiveStatus("error");
       }
-    }, 700);
+    }, 1300);
 
     return () => {
       clearTimeout(timeout);
@@ -824,6 +859,7 @@ export default function App() {
                   </button>
                 </div>
                 <div className="training-table">
+                  <div className="note">Showing latest 4 rows (stack view).</div>
                   <div className="training-header">
                     <span>Created</span>
                     <span>Model</span>
@@ -831,7 +867,7 @@ export default function App() {
                     <span>Label</span>
                     <span>Actions</span>
                   </div>
-                  {trainingRows.map((row) => (
+                  {trainingRows.slice(0, 4).map((row) => (
                     <div key={row.id} className="training-row">
                       <span>{row.created_at ? row.created_at.slice(0, 19).replace("T", " ") : ""}</span>
                       <span>{row.model_used || "n/a"}</span>

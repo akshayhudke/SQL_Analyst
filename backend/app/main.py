@@ -6,7 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .models import AnalyzeRequest
 from .sql_parser import parse_sql
-from .db import explain_query, run_preview, fetch_table_columns
+from .db import explain_query, run_preview
+from .diagnostics import collect_diagnostics
 from .plan_summary import summarize_plan
 from .rules import run_rules, build_index_recommendations, score_findings
 from .llm import generate_explanation
@@ -22,7 +23,7 @@ from .training_store import (
     update_feedback,
 )
 from .ollama_logs import get_logs
-from .settings import LLM_ONLY_REWRITE, MEMORY_REWRITE_ENABLED
+from .settings import LLM_ONLY_REWRITE, MEMORY_REWRITE_ENABLED, RULE_FALLBACK_REWRITE
 
 app = FastAPI(title="SQL Analyst MVP")
 
@@ -61,28 +62,70 @@ def analyze(request: AnalyzeRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    preview = None
-    if request.run_preview:
-        try:
-            preview = run_preview(normalized_sql)
-        except Exception as exc:
-            warnings.append(f"Preview failed: {exc}")
+    supports_execution = bool(parsed_sql.get("supports_execution"))
+    statement_type = str(parsed_sql.get("statement_type", "UNKNOWN"))
 
-    plan = None
     try:
-        plan = explain_query(normalized_sql, analyze=request.run_analyze)
+        diagnostics = collect_diagnostics(parsed_sql)
     except Exception as exc:
-        warnings.append(f"Explain failed: {exc}")
-
-    columns_by_table = {}
-    try:
-        columns_by_table = fetch_table_columns(parsed_sql.get("tables", []))
-    except Exception as exc:
+        diagnostics = {
+            "schema_metadata": {},
+            "table_statistics": {},
+            "columns_by_table": {},
+            "missing_tables": parsed_sql.get("tables", []),
+            "execution_allowed": False,
+        }
         warnings.append(f"Schema lookup failed: {exc}")
 
+    columns_by_table = diagnostics.get("columns_by_table", {})
+    schema_metadata = diagnostics.get("schema_metadata", {})
+    table_statistics = diagnostics.get("table_statistics", {})
+    missing_tables = diagnostics.get("missing_tables", [])
+    execution_allowed = bool(diagnostics.get("execution_allowed")) and supports_execution
+
+    if not supports_execution:
+        warnings.append(
+            f"Execution skipped for {statement_type} query type. Static analysis only."
+        )
+    elif missing_tables:
+        warnings.append(
+            "Execution skipped because some tables are not in the connected database: "
+            + ", ".join(missing_tables)
+        )
+
+    preview = None
+    if request.run_preview:
+        if execution_allowed:
+            try:
+                preview = run_preview(normalized_sql)
+            except Exception as exc:
+                warnings.append(f"Preview failed: {exc}")
+        else:
+            warnings.append("Preview skipped: requires a read-only SELECT on known local tables.")
+
+    plan = None
+    if execution_allowed and request.analysis_mode == "manual":
+        try:
+            plan = explain_query(normalized_sql, analyze=request.run_analyze)
+        except Exception as exc:
+            warnings.append(f"Explain failed: {exc}")
+    elif request.analysis_mode == "live":
+        warnings.append("Live mode uses static analysis only to avoid heavy database load.")
+
     plan_summary = summarize_plan(plan) if plan else None
-    rule_findings = run_rules(parsed_sql, plan)
+    rule_findings = run_rules(parsed_sql, plan, schema_metadata=schema_metadata)
     index_recommendations = build_index_recommendations(parsed_sql, columns_by_table)
+    recommendation_blockers = {
+        "sql_group_by_mismatch",
+        "sql_possible_type_mismatch",
+        "sql_implicit_type_conversion",
+        "sql_date_literal_mismatch",
+        "sql_join_missing_condition",
+        "sql_write_no_where",
+    }
+    finding_ids = {item.get("id") for item in rule_findings}
+    if finding_ids & recommendation_blockers:
+        index_recommendations = []
     optimization_score = score_findings(rule_findings)
     why_slow = [
         {
@@ -102,13 +145,44 @@ def analyze(request: AnalyzeRequest) -> dict:
         "plan_summary": plan_summary,
         "rule_findings": rule_findings,
         "columns_by_table": columns_by_table,
+        "schema_metadata": schema_metadata,
+        "table_statistics": table_statistics,
         "memory_examples": memory_examples,
         "index_recommendations": index_recommendations,
         "optimization_score": optimization_score,
+        "execution_allowed": execution_allowed,
+        "missing_tables": missing_tables,
     }
-    llm_output = generate_explanation(llm_payload, mode=request.analysis_mode)
+    critical_rule_ids = {
+        finding.get("id")
+        for finding in rule_findings
+        if finding.get("id") in {"sql_group_by_mismatch", "sql_write_no_where"}
+    }
+    skip_llm_for_deterministic_fix = bool(RULE_FALLBACK_REWRITE and critical_rule_ids)
+    if skip_llm_for_deterministic_fix:
+        warnings.append(
+            "LLM skipped for deterministic correctness fix: "
+            + ", ".join(sorted(critical_rule_ids))
+        )
+        llm_output = {
+            "explanation": "Used deterministic SQL correctness checks before LLM.",
+            "suggested_sql": None,
+            "recommendation_rationale": (
+                "A deterministic fix was applied because the query has a correctness issue."
+            ),
+            "rewrite_source": "rules",
+            "model_used": None,
+        }
+    else:
+        llm_output = generate_explanation(llm_payload, mode=request.analysis_mode)
 
-    if not LLM_ONLY_REWRITE:
+    llm_has_rewrite = bool(llm_output and llm_output.get("suggested_sql"))
+    llm_has_error = bool(llm_output and llm_output.get("error"))
+    should_try_rule_rewrite = (not LLM_ONLY_REWRITE) or (
+        RULE_FALLBACK_REWRITE and (not llm_has_rewrite or llm_has_error)
+    )
+
+    if should_try_rule_rewrite:
         rule_rewrite, rewrite_notes = rewrite_query(
             original_sql, parsed_sql, columns_by_table
         )
@@ -119,10 +193,10 @@ def analyze(request: AnalyzeRequest) -> dict:
                     "suggested_sql": None,
                     "recommendation_rationale": None,
                     "rewrite_source": None,
-                }
+            }
             if not llm_output.get("suggested_sql"):
                 llm_output["suggested_sql"] = rule_rewrite
-                llm_output["rewrite_source"] = "rules"
+                llm_output["rewrite_source"] = "rules-fallback" if llm_has_error else "rules"
                 if not llm_output.get("explanation"):
                     llm_output["explanation"] = "Rule-based rewrite generated from schema metadata."
                 if rewrite_notes:
@@ -163,6 +237,8 @@ def analyze(request: AnalyzeRequest) -> dict:
                 "optimization_score": optimization_score,
                 "llm_payload": llm_payload,
                 "llm_output": llm_output,
+                "schema_metadata": schema_metadata,
+                "table_statistics": table_statistics,
                 "run_analyze": request.run_analyze,
                 "run_preview": request.run_preview,
                 "warnings": warnings,
@@ -181,6 +257,13 @@ def analyze(request: AnalyzeRequest) -> dict:
             "why_slow": why_slow,
             "index_recommendations": index_recommendations,
             "optimization_score": optimization_score,
+        },
+        "diagnostics": {
+            "statement_type": statement_type,
+            "execution_allowed": execution_allowed,
+            "missing_tables": missing_tables,
+            "schema_metadata": schema_metadata,
+            "table_statistics": table_statistics,
         },
         "preview": preview,
         "raw_plan": plan,
